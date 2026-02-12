@@ -1,1 +1,6 @@
+# 构建目录（不要提交，否则 GitHub 语言统计会被 raylib 的 C 代码主导）
 build/
+build_release/
+
+# CMake 下载的依赖源码（raylib 等，也不应提交）
+_deps/
