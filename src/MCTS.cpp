@@ -4,99 +4,137 @@
 #include <map>
 
 AmazonMove MCTS::GetBestMove(AmazonBoard currentBoard, int aiPlayer, int iterations) {
-    auto root = std::make_unique<MCTSNode>(currentBoard, aiPlayer);
-    
-    for (int i = 0; i < iterations; ++i) {
-        MCTSNode* curr = root.get();
-        
-        // 1. Selection & Expansion 
-        if (curr->children.empty()) {
-            std::vector<AmazonMove> moves = getAllLegalMoves(curr->board, curr->playerToMove);
-            for (auto& m : moves) {
-                AmazonBoard nextBoard = curr->board;
-                // 执行动作
-                nextBoard.grid[m.qy1][m.qx1] = EMPTY;
-                nextBoard.grid[m.qy2][m.qx2] = curr->playerToMove;
-                nextBoard.grid[m.ay][m.ax] = ARROW;
+    // 先检查根节点是否有合法走法，没有就直接返回一个空动作
+    std::vector<AmazonMove> rootMoves = getAllLegalMoves(currentBoard, aiPlayer);
+    if (rootMoves.empty()) {
+        return AmazonMove{0, 0, 0, 0, 0, 0};
+    }
 
-                //这是修改后的
-                auto newNode = std::make_unique<MCTSNode>(nextBoard,3-curr->playerToMove,curr);
-                newNode->move = m;
-                curr->children.push_back(std::move(newNode));
-                //curr->children.push_back(std::make_unique<MCTSNode>(nextBoard, 3 - curr->playerToMove, curr));（这里有问题，导致了bot棋子的增加，但是没搞清楚具体为啥）
+    auto root = std::make_unique<MCTSNode>(currentBoard, aiPlayer);
+
+    // 使用一个固定的随机数引擎，比 rand() 更稳定
+    static thread_local std::mt19937 rng(std::random_device{}());
+
+    for (int i = 0; i < iterations; ++i) {
+        MCTSNode* node = root.get();
+
+        // 1. Selection：沿着 UCB1 一直往下走，直到叶子或终局
+        while (!node->children.empty()) {
+            // 如果这个节点已经无子可走，相当于终局，直接停止选择
+            if (getAllLegalMoves(node->board, node->playerToMove).empty()) {
+                break;
+            }
+            node = node->selectChild();
+        }
+
+        // 2. Expansion：如果不是终局，则展开一次（生成子节点）
+        std::vector<AmazonMove> moves = getAllLegalMoves(node->board, node->playerToMove);
+        if (!moves.empty()) {
+            if (node->children.empty()) {
+                node->children.reserve(moves.size());
+                for (auto& m : moves) {
+                    AmazonBoard nextBoard = node->board;
+                    // 执行动作
+                    nextBoard.grid[m.qy1][m.qx1] = EMPTY;
+                    nextBoard.grid[m.qy2][m.qx2] = node->playerToMove;
+                    nextBoard.grid[m.ay][m.ax] = ARROW;
+
+                    auto newNode = std::make_unique<MCTSNode>(nextBoard, 3 - node->playerToMove, node);
+                    newNode->move = m;
+                    node->children.push_back(std::move(newNode));
+                }
+            }
+
+            // 从当前节点的孩子中选择一个用于模拟：优先选未访问的，否则再用 UCB
+            MCTSNode* next = nullptr;
+            for (auto& ch : node->children) {
+                if (ch->visits == 0) {
+                    next = ch.get();
+                    break;
+                }
+            }
+            if (!next && !node->children.empty()) {
+                next = node->selectChild();
+            }
+            if (next) {
+                node = next;
             }
         }
-        
-        // 2. Simulation (模拟)，现在进行了简单的评估
-        if (!curr->children.empty()) {
-            //这里是随机找一个走法走，现在引入了评估函数，需要修改
-            MCTSNode* pick = curr->selectChild();
-            double result = simulate(pick->board, pick->playerToMove);
-            
-            // 3. Backpropagation (回传)，让最底下这一步以及这一步的所有上级步骤visits++，这里可以不改
-            MCTSNode* back = pick;
-            while (back) {
-                back->visits++;
-                back->wins += result;
-                back = back->parent;
-            }
+
+        // 3. Simulation：从选中的节点开始随机模拟，对 AI 视角打分
+        double result = simulate(node->board, node->playerToMove, aiPlayer);
+
+        // 4. Backpropagation：沿父链回溯，将结果累加到路径上的所有节点
+        MCTSNode* back = node;
+        while (back) {
+            back->visits++;
+            back->wins += result; // result 始终是从 aiPlayer 视角的“好坏”
+            back = back->parent;
         }
     }
 
-    // 返回访问次数最多的动作
-    double maxAverageScores = -1;
-    AmazonMove bestMove;
+    // 选平均得分最高的根节点子节点作为最终落子
+    AmazonMove bestMove = rootMoves[0];
+    double bestScore = -1.0;
     for (auto& child : root->children) {
-        double thisAverageScores = child->wins/(double)child->visits;
-        if (thisAverageScores > maxAverageScores) {
-            maxAverageScores = thisAverageScores;
+        if (child->visits == 0) continue;
+        double avg = child->wins / static_cast<double>(child->visits);
+        if (avg > bestScore) {
+            bestScore = avg;
             bestMove = child->move;
         }
     }
     return bestMove;
 }
 
-// 模拟函数：随机走子直到没地方可走(经过修改我让它只走十步。但是bot应该会变得更加智能，因为我添加了评估函数)
-double MCTS::simulate(AmazonBoard tempBoard, int p) {
-    // 设置最大模拟步数，防止死循环（虽然亚马逊棋必然会结束，但限制步数能提高效率）
-    int maxSteps = 10; 
-    int currentP = p;
-    
-    for (int step = 0; step < maxSteps; ++step) { 
-        // 1. 获取当前玩家的所有合法动作
-        // 注意：这里必须调用你已经写好的 getAllLegalMoves
-        std::vector<AmazonMove> moves = getAllLegalMoves(tempBoard, currentP);
+// 模拟函数：从某个节点开始随机走，结果始终从 aiPlayer 视角来评估
+double MCTS::simulate(AmazonBoard tempBoard, int currentPlayer, int aiPlayer) {
+    // 设置最大模拟步数，防止死循环
+    const int maxSteps = 20;
 
-        // 2. 如果没有合法动作，说明当前玩家输了
+    static thread_local std::mt19937 rng(std::random_device{}());
+
+    for (int step = 0; step < maxSteps; ++step) {
+        std::vector<AmazonMove> moves = getAllLegalMoves(tempBoard, currentPlayer);
+
+        // 没有合法走法：当前玩家输
         if (moves.empty()) {
-            // 返回赢家：如果是玩家1没法走了，玩家2赢；反之亦然
-            return (currentP == 1) ? 0 : 1;//如果赢了就给一个比较好的分数
+            // 如果当前没法走的是 AI，自然是 0 分；反之是 1 分
+            return (currentPlayer == aiPlayer) ? 0.0 : 1.0;
         }
 
-        // 3. 利用 rand() 随机选择一个动作
-        int randomIndex = rand() % moves.size();
-        AmazonMove m = moves[randomIndex];
+        std::uniform_int_distribution<int> dist(0, static_cast<int>(moves.size()) - 1);
+        AmazonMove m = moves[dist(rng)];
 
-        // 4. 在临时棋盘上执行这个动作
-        tempBoard.grid[m.qy1][m.qx1] = 0;      // 原位置清空
-        tempBoard.grid[m.qy2][m.qx2] = currentP; // 移动女王
-        tempBoard.grid[m.ay][m.ax] = 3;        // 射出箭（假设 3 是障碍物/箭）
+        // 执行动作
+        tempBoard.grid[m.qy1][m.qx1] = EMPTY;
+        tempBoard.grid[m.qy2][m.qx2] = currentPlayer;
+        tempBoard.grid[m.ay][m.ax] = ARROW;
 
-        // 5. 切换玩家
-        currentP = (currentP == 1) ? 2 : 1;
+        // 轮到另外一方
+        currentPlayer = 3 - currentPlayer;
     }
-    double botMoves = (double)getAllLegalMoves(tempBoard,1).size()+1;
-    double playerMoves = (double)getAllLegalMoves(tempBoard,2).size()+1;
-    double score = double(botMoves/(playerMoves+botMoves));
-    // 如果达到最大步数还没分胜负（极少见），可以返回平局 0 或根据领地估分
-    return score; 
+
+    // 没有走到终局，用行动力（合法步数）来估分
+    int myMoves = static_cast<int>(getAllLegalMoves(tempBoard, aiPlayer).size());
+    int oppMoves = static_cast<int>(getAllLegalMoves(tempBoard, 3 - aiPlayer).size());
+    int total = myMoves + oppMoves;
+    if (total == 0) {
+        return 0.5; // 双方都动不了，当成平局
+    }
+    return static_cast<double>(myMoves) / static_cast<double>(total);
 }
 
 // 我需要一个评估函数，来找到对bot最有利的走法。“最有利”的衡量是合法步数之比。
 double MCTS::evaluateBoard(const AmazonBoard& mBoard, int mPlayer){
-    auto myMoves = getAllLegalMoves(mBoard, mPlayer).size();
-    auto enemyMoves = getAllLegalMoves(mBoard, 3-mPlayer).size();
-    return (double)(myMoves/enemyMoves);
+    auto myMoves = static_cast<int>(getAllLegalMoves(mBoard, mPlayer).size());
+    auto enemyMoves = static_cast<int>(getAllLegalMoves(mBoard, 3 - mPlayer).size());
+
+    int total = myMoves + enemyMoves;
+    if (total == 0) {
+        return 0.5; // 双方都被封死
+    }
+    return static_cast<double>(myMoves) / static_cast<double>(total);
 }
 
 // 获得一个行动方式的数组，包含该状态下所有合法的行动方式

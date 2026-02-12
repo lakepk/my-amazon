@@ -52,7 +52,7 @@ public:
     
 private:
     // 模拟随机下棋直到结束
-    double simulate(AmazonBoard tempBoard, int player);
+    double simulate(AmazonBoard tempBoard, int currentPlayer, int aiPlayer);
 };
 
 #endif
